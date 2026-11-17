@@ -36,6 +36,8 @@ if TYPE_CHECKING:
 _SOURCE_NAME = "pdf-page"
 _WORD = re.compile(r"[a-z]+|\d+")
 _YEAR = re.compile(r"(?<!\d)(?:19|20)\d{2}(?!\d)")
+_STATEMENT_WEIGHT = 1.0
+_NUMERIC_WEIGHT = 0.2
 _STOP_WORDS = frozenset(
     "a about according across all also an analyst and any are as at be been being by calculate can "
     "could data define detail directly do does during each else for from give had has have how i if "
@@ -211,7 +213,11 @@ async def search_pdf_pages(
     # not discard pages whose terminology differs from the question.
     head = await memory.list()
     candidates = []
-    for record in head.entries:
+    # Storage iteration order is not a contract; sort so ranking is reproducible.
+    for record in sorted(
+        head.entries,
+        key=lambda item: (item.entry.text, item.entry.sources[0].source_id if item.entry.sources else ""),
+    ):
         sources = tuple(source for source in record.entry.sources if source.source_type == _SOURCE_NAME)
         if len(sources) == 1:
             document, _, body = record.entry.text.partition("\n")
@@ -264,7 +270,7 @@ async def search_pdf_pages(
     ranked = []
     for index, (citation, source, document, tokens, counts) in enumerate(pages):
         norm = 1.2 * (0.45 + 0.55 * len(tokens) / average_length)
-        lexical = sum(weights[term] * count * 2.2 / (count + norm) for term, count in counts.items())
+        lexical = sum(weights[term] * count * 2.2 / (count + norm) for term, count in sorted(counts.items()))
         text, heading = _normalized(tokens), _normalized(tokens[:90])
         matched = [
             number
@@ -284,7 +290,7 @@ async def search_pdf_pages(
             score += 0.15 * len(years.intersection(tokens))
             ranked.append((score, index, citation, source, tuple(matched)))
 
-    ranked.sort(key=lambda item: -item[0])
+    ranked.sort(key=lambda item: (-item[0], pages[item[1]][0].entry_id))
 
     # Second ranking signal: plain BM25 over the query plus the matched accounting
     # concept vocabulary. Fusing both keeps the tuned ranking's precision while
@@ -304,10 +310,11 @@ async def search_pdf_pages(
     for index, page in enumerate(pages):
         norm = 1.2 * (0.45 + 0.55 * len(page[-2]) / average_length)
         plain = sum(
-            expanded_weights[term] * count * 2.2 / (count + norm) for term, count in expanded_counts[index].items()
+            expanded_weights[term] * count * 2.2 / (count + norm)
+            for term, count in sorted(expanded_counts[index].items())
         )
         plain_scores.append((plain, index))
-    plain_scores.sort(key=lambda item: -item[0])
+    plain_scores.sort(key=lambda item: (-item[0], pages[item[1]][0].entry_id))
     plain_rank = {index: rank for rank, (_plain, index) in enumerate(plain_scores, start=1)}
 
     numeric_scores = []
@@ -319,8 +326,8 @@ async def search_pdf_pages(
         statement_scores.append(
             (1.0 if any(head in bodies[index][:220].lower() for head in _STATEMENT_HEADS) else 0.0, index)
         )
-    numeric_scores.sort(key=lambda item: -item[0])
-    statement_scores.sort(key=lambda item: -item[0])
+    numeric_scores.sort(key=lambda item: (-item[0], pages[item[1]][0].entry_id))
+    statement_scores.sort(key=lambda item: (-item[0], pages[item[1]][0].entry_id))
     numeric_rank = {index: rank for rank, (_density, index) in enumerate(numeric_scores, start=1)}
     statement_rank = {index: rank for rank, (_statement, index) in enumerate(statement_scores, start=1)}
 
@@ -330,12 +337,12 @@ async def search_pdf_pages(
         index: (
             1.0 / (60 + tuned_rank.get(index, missing))
             + 1.0 / (60 + plain_rank.get(index, missing))
-            + 0.5 / (60 + statement_rank.get(index, missing))
-            + 0.5 / (60 + numeric_rank.get(index, missing))
+            + _STATEMENT_WEIGHT / (60 + statement_rank.get(index, missing))
+            + _NUMERIC_WEIGHT / (60 + numeric_rank.get(index, missing))
         )
         for index in range(len(pages))
     }
-    order = sorted(fused, key=lambda index: -fused[index])
+    order = sorted(fused, key=lambda index: (-round(fused[index], 12), plain_rank.get(index, missing), pages[index][0].entry_id))
 
     results = []
     seen_source: set[str] = set()
