@@ -1,5 +1,7 @@
 # 时间回声档案馆
 
+提交的 DSL 使用 Dify `0.3.1` 导出格式，并采用当前 HTTP Request 节点字段（`timeout.connect/read/write` 与 `retry_config.enabled`）。
+
 “时间回声档案馆”是一个可重复游玩的中文互动剧情工作流。玩家每轮输入一个决定；Dify 先从 PowerContext 召回这个玩家过去的选择，LLM 让旧选择在新剧情里产生可见后果，再把本轮选择和结果写回 PowerContext。使用同一个 `player_id` 开启下一轮，即使是新的 Dify 请求，也会继承此前时间线。
 
 ## 技术分工
@@ -26,7 +28,7 @@ Start -> 构建召回请求 -> POST /v1/context/prepare -> 解析历史
 
 ## 运行环境
 
-- Dify Cloud 或 Dify self-hosted，支持 DSL `version: 0.3.0`。
+- Dify Cloud 或 Dify self-hosted，支持 DSL `version: 0.3.1`。
 - `langgenius/openai_api_compatible` 插件 `0.0.16`，或导入后将 LLM 节点重新绑定到可用的聊天模型。
 - PowerContext 当前 `master`，Python 3.11+，`uv`。
 - 任选一个 OpenAI Compatible 聊天模型。DSL 默认模型名是 `gpt-4o-mini`；模型名称不一致时，只需在“生成受记忆影响的新剧情”节点重新选择模型。

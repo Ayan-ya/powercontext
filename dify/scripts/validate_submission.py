@@ -61,6 +61,13 @@ def validate_graph(document: dict[str, Any]) -> tuple[int, int]:
     for node in nodes:
         if node["data"]["type"] == "code":
             compile(node["data"]["code"], f"dsl-node-{node['id']}", "exec")
+        if node["data"]["type"] == "http-request":
+            data = node["data"]
+            timeout = data.get("timeout", {})
+            retry = data.get("retry_config", {})
+            require(set(timeout) == {"connect", "read", "write"}, f"Invalid HTTP timeout schema: {node['id']}")
+            require("enabled" in retry, f"Invalid HTTP retry schema: {node['id']}")
+            require("retry_enabled" not in retry, f"Legacy HTTP retry schema: {node['id']}")
     return len(nodes), len(edges)
 
 
@@ -79,11 +86,11 @@ def validate_secrets() -> int:
 def main() -> None:
     document = yaml.safe_load(DSL.read_text(encoding="utf-8"))
     require(document["kind"] == "app", "DSL kind must be app")
-    require(document["version"] == "0.3.0", "DSL version must be 0.3.0")
+    require(document["version"] == "0.3.1", "DSL version must be 0.3.1")
     require(document["app"]["mode"] == "workflow", "This submission expects workflow mode")
     nodes, edges = validate_graph(document)
     files = validate_secrets()
-    print(f"OK: DSL 0.3.0, {nodes} nodes, {edges} edges, {files} files scanned")
+    print(f"OK: DSL 0.3.1, {nodes} nodes, {edges} edges, {files} files scanned")
 
 
 if __name__ == "__main__":
