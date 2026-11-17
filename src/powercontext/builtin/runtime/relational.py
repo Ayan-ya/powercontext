@@ -991,6 +991,8 @@ class RelationalContexts:
             embedding_profile = query_embedding.embedding_profile
         scope = validate_scope_id(scope_id)
         async with self.database.transaction() as connection:
+            from powercontext.builtin.runtime.source_lifecycle import unavailable_topics
+
             return await self.repositories.topic_memories.search(
                 connection,
                 scope,
@@ -1000,6 +1002,7 @@ class RelationalContexts:
                 query_vector=query_vector,
                 embedding_profile=embedding_profile,
                 admission=admission,
+                excluded_artifact_ids=await unavailable_topics(connection, scope),
             )
 
     async def search_skills(

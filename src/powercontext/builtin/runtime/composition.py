@@ -150,6 +150,7 @@ from powercontext.builtin.runtime.processing_registry import (
     dream_operations,
     processing_capabilities,
 )
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycle
 from powercontext.builtin.runtime.protocols import RuntimeTracing
 from powercontext.builtin.runtime.readiness import (
     CachedReadinessProbe,
@@ -657,6 +658,7 @@ async def open_builtin_runtime(
                 remote_ingestion=contexts,
             )
         )
+        runtime.lifecycle = SourceLifecycle(contexts)
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
             _open_artifact_processing_supervisor(config, contexts, processing_bindings, tracing=tracing)
         )

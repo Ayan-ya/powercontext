@@ -300,6 +300,7 @@ if TYPE_CHECKING:
 
     from powercontext.builtin.handoff_report.application import HandoffReportApplication
     from powercontext.builtin.runtime.artifact_processing import ArtifactProcessingSupervisors
+    from powercontext.builtin.runtime.source_lifecycle import SourceLifecycle
 
 
 class TopicMemorySearch(Protocol):
@@ -2987,6 +2988,8 @@ def _log_scheduled_processing(
 
 class BuiltinRuntime:
     """Add business-specific operations over composed built-in contexts."""
+
+    lifecycle: SourceLifecycle
 
     def __init__(
         self,
