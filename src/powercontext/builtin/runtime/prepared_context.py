@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -56,6 +57,8 @@ class _PreparedContextEntry:
     citation: dict[str, object]
     content: str
     truncated: bool
+    start: int | None = None
+    end: int | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +109,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -115,6 +119,16 @@ class MemoryEntryAddress:
     memory: ArtifactAddress
     entry_id: str
     entry_version_id: str
+
+
+@dataclass(frozen=True)
+class PreparedFragment:
+    """One literal, addressable slice of a Memory entry selected as evidence."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 PreparedContextOrigin = MemoryCitation | ArtifactRef | MemoryEntryAddress | ArtifactAddress
@@ -235,7 +249,7 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
-        content, origins, omissions = self._select_entries(
+        content, origins, omissions, fragments = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
             memory_candidates=memory_candidates,
@@ -244,7 +258,7 @@ class PreparedContextBuilder:
             topic_memory_hits=topic_memory_hits,
         )
         if content is None:
-            return PreparedContextBuild(context=self.empty(), origins=(), omissions=omissions)
+            return PreparedContextBuild(context=self.empty(), origins=(), omissions=omissions, fragments=fragments)
         content_bytes = len(content.encode("utf-8"))
         # The assembly path is bounded by construction (every fitted item is measured against
         # `max_bytes`), so the ceiling check belongs to the non-assembly renderer only.
@@ -254,6 +268,7 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+            fragments=fragments,
         )
 
     def probe_budget(
@@ -277,7 +292,7 @@ class PreparedContextBuilder:
         counters because both go through :meth:`_select_entries`.
         """
 
-        content, origins, omissions = self._select_entries(
+        content, origins, omissions, _fragments = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
             memory_candidates=memory_candidates,
@@ -303,17 +318,26 @@ class PreparedContextBuilder:
         topic_memory_hits: Sequence[TopicMemorySearchHit],
         experience_candidates: Sequence[PreparedExperienceCandidates],
         profile_candidates: Sequence[PreparedProfileCandidate],
-    ) -> tuple[str | None, tuple[PreparedContextOrigin, ...], PreparedContextOmissions]:
+    ) -> tuple[
+        str | None, tuple[PreparedContextOrigin, ...], PreparedContextOmissions, tuple[PreparedFragment, ...]
+    ]:
         """Run one complete pure selection pass and render it.
 
-        Returns ``(content, origins, omissions)``; ``content`` is ``None`` exactly when nothing
-        was selected, which is the empty-result case for both paths. This is the single
+        Returns ``(content, origins, omissions, fragments)``; ``content`` is ``None`` exactly when
+        nothing was selected, which is the empty-result case for both paths. This is the single
         selection path shared by :meth:`build_scopes_result` and :meth:`probe_budget`, so the
         probe's counters always describe the selection the build would actually perform.
         """
 
+        if request.evidence_selection and request.assembly is None:
+            return self._select_fragments(
+                request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         if request.assembly is not None:
-            return self._select_text(
+            content, origins, omissions = self._select_text(
                 request,
                 current_scope_id=current_scope_id,
                 memory_candidates=memory_candidates,
@@ -321,6 +345,7 @@ class PreparedContextBuilder:
                 profile_candidates=profile_candidates,
                 topic_memory_hits=topic_memory_hits,
             )
+            return content, origins, omissions, ()
 
         memory_entries = _interleave_groups(
             tuple(
@@ -344,8 +369,8 @@ class PreparedContextBuilder:
         )[: self.experience_entry_limit]
         entries, omissions = self._fit_entries(request, memory_entries, topic_memory_entries, experience_entries)
         if not entries:
-            return None, (), omissions
-        return _render(entries), tuple(entry.origin for entry in entries), omissions
+            return None, (), omissions, ()
+        return _render(entries), tuple(entry.origin for entry in entries), omissions, ()
 
     def _select_text(
         self,
@@ -432,6 +457,75 @@ class PreparedContextBuilder:
             return None, (), omissions
         content = render_context_text(included, assembly)
         return content, tuple(origins), omissions
+
+    def _select_fragments(
+        self,
+        request: PrepareContextRequest,
+        *,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> tuple[
+        str | None, tuple[PreparedContextOrigin, ...], PreparedContextOmissions, tuple[PreparedFragment, ...]
+    ]:
+        """Select literal query-relevant slices instead of whole Memory entries.
+
+        Each fragment keeps a character range into the original entry text, so a citation
+        resolves back to the exact evidence without re-reading the whole record.
+        """
+
+        entries: list[_PreparedContextEntry] = []
+        fragments: list[PreparedFragment] = []
+        for candidates in memory_candidates:
+            scope_id = candidates.scope_id or current_scope_id or ""
+            for hit in candidates.hits:
+                text = hit.text
+                if not text.strip():
+                    continue
+                window = min(len(text), request.max_bytes)
+                while window >= _MIN_FRAGMENT_CHARS:
+                    start, end = _match_window(text, request.query, window)
+                    entry = _PreparedContextEntry(
+                        origin=MemoryCitation(
+                            memory_ref=hit.memory_ref,
+                            entry_id=hit.entry_id,
+                            entry_version_id=hit.entry_version_id,
+                        ),
+                        kind="memory",
+                        citation={
+                            "scope_id": scope_id,
+                            "memory_ref": hit.memory_ref.model_dump(mode="json"),
+                            "entry_id": hit.entry_id,
+                            "entry_version_id": hit.entry_version_id,
+                        },
+                        content=text[start:end],
+                        truncated=False,
+                        start=start,
+                        end=end,
+                    )
+                    if _rendered_bytes((*entries, entry)) <= request.max_bytes:
+                        entries.append(entry)
+                        fragments.append(
+                            PreparedFragment(
+                                address=MemoryEntryAddress(
+                                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                                    entry_id=hit.entry_id,
+                                    entry_version_id=hit.entry_version_id,
+                                ),
+                                start=start,
+                                end=end,
+                                text=text[start:end],
+                            )
+                        )
+                        break
+                    window = int(window * 0.7)
+        if not entries:
+            return None, (), PreparedContextOmissions(), ()
+        return (
+            _render(entries),
+            tuple(entry.origin for entry in entries),
+            PreparedContextOmissions(),
+            tuple(fragments),
+        )
 
     def _profile_entries(self, candidates: Sequence[PreparedProfileCandidate]) -> tuple[_PreparedContextEntry, ...]:
         entries = []
@@ -685,6 +779,59 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     return tuple(ordered)
 
 
+_TOKEN_PATTERN = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]+")
+_MIN_FRAGMENT_CHARS = 80
+_SENTENCE_ENDINGS = "\n。！？.!?"
+
+
+def _query_tokens(query: str) -> tuple[str, ...]:
+    return tuple(token.lower() for token in _TOKEN_PATTERN.findall(query))
+
+
+def _match_window(text: str, query: str, window: int) -> tuple[int, int]:
+    """Return the literal character range that best covers the query terms."""
+
+    if len(text) <= window:
+        return 0, len(text)
+    tokens = _query_tokens(query)
+    lowered = text.lower()
+    matches: list[tuple[int, int]] = []
+    for token in tokens:
+        position = lowered.find(token)
+        while position >= 0:
+            matches.append((position, position + len(token)))
+            position = lowered.find(token, position + 1)
+    if not matches:
+        return 0, window
+
+    unique = set(tokens)
+    best: tuple[tuple[int, int], int, int] | None = None
+    for start, end in matches:
+        low = max(0, min(start - window // 3, len(text) - window))
+        high = low + window
+        covered = sum(1 for token in unique if token in lowered[low:high])
+        score = (covered, -abs(high - end))
+        if best is None or score > best[0]:
+            best = (score, low, high)
+    assert best is not None
+    _, low, high = best
+    return _extend_to_boundary(text, low, high)
+
+
+def _extend_to_boundary(text: str, low: int, high: int) -> tuple[int, int]:
+    if high < len(text):
+        cutoff = min(len(text), high + 120)
+        while high < cutoff and text[high] not in _SENTENCE_ENDINGS:
+            high += 1
+        if high < len(text) and text[high] in _SENTENCE_ENDINGS:
+            high += 1
+    if low > 0:
+        cutoff = max(0, low - 120)
+        while low > cutoff and text[low - 1] not in _SENTENCE_ENDINGS:
+            low -= 1
+    return low, high
+
+
 def _render(entries: Sequence[_PreparedContextEntry]) -> str:
     envelope = {
         "trust": "untrusted_history",
@@ -715,6 +862,9 @@ def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
         "content": entry.content,
         "truncated": entry.truncated,
     }
+    if entry.start is not None and entry.end is not None:
+        rendered["start"] = entry.start
+        rendered["end"] = entry.end
     if entry.kind != "memory":
         rendered["kind"] = entry.kind
     return rendered
