@@ -1,0 +1,45 @@
+{
+  "name": "stepseek-local-knowledge",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20 <24"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n web,api -c cyan,green \"npm:dev:web\" \"npm:dev:api\"",
+    "dev:web": "vite",
+    "dev:api": "tsx watch server/index.ts",
+    "seekdb:up": "docker compose up -d seekdb",
+    "seekdb:down": "docker compose down",
+    "build": "tsc --noEmit && vite build",
+    "start": "tsx server/index.ts",
+    "test": "vitest run",
+    "verify": "npm run test && npm run build && npm run verify:seekdb",
+    "verify:seekdb": "node scripts/verify-seekdb.mjs"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.3.2",
+    "express": "^5.1.0",
+    "lucide-react": "^0.468.0",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "seekdb": "1.3.0"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.30",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^4.6.0",
+    "concurrently": "^9.2.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.8.3",
+    "vite": "6.4.6",
+    "vitest": "5.1.0"
+  },
+  "overrides": {
+    "@seekdb/js-bindings": "1.4.0",
+    "adm-zip": "^0.6.1"
+  }
+}
