@@ -117,6 +117,7 @@ class ArtifactProcessingBinding:
     # Only automatic admission is filtered; already accepted requests retain
     # their own Worker authorization and domain completion semantics.
     automatic_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
+    source_count_scope_filter: Callable[[AsyncConnection, tuple[str, ...]], Awaitable[frozenset[str]]] | None = None
 
     def __post_init__(self) -> None:
         if not self.binding_name or self.binding_name != self.binding_name.strip():
@@ -395,6 +396,8 @@ class _FamilyState:
     scan_after: int = 0
     scan_generation: int = 0
     scan_in_progress: bool = False
+    count_after: int = 0
+    next_count_at: float = 0.0
     reconcile_after: str | None = None
     reconcile_complete: bool = False
     notification_at_start: int = 0
@@ -781,6 +784,48 @@ class ArtifactProcessingSupervisor:
         state.next_discovery_at = next_discovery_at
         for scope in admitted:
             self._enqueue(state, scope)
+        await self._discover_source_count(state)
+
+    async def _discover_source_count(self, state: _FamilyState) -> None:
+        binding = state.binding
+        scope_filter = binding.source_count_scope_filter
+        loop = asyncio.get_running_loop()
+        limit = self._fresh_capacity(state)
+        if scope_filter is None or limit <= 0 or loop.time() < state.next_count_at:
+            return
+
+        admitted = []
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            rows = await self._intents.scan(
+                connection, binding.binding_name, after_sequence=state.count_after, limit=limit, dirty_only=True
+            )
+            candidates = tuple(
+                row.scope_id
+                for row in rows
+                if row.requested_generation == row.handled_generation
+                and row.scope_id not in state.queued
+                and row.scope_id not in state.running
+                and row.scope_id not in state.retries
+            )
+            if candidates:
+                eligible = await scope_filter(connection, candidates)
+                for scope in candidates:
+                    if scope in eligible and await self._intents.request_if_dirty_and_idle(
+                        connection, scope, binding.binding_name
+                    ):
+                        admitted.append(scope)
+
+        # Count discovery has its own cursor and deadline so it never consumes
+        # or resets a scheduled scan. Requests survive a restart in the intent table.
+        if len(rows) == limit:
+            state.count_after = rows[-1].pending_sequence
+            state.next_count_at = loop.time() + _DISCOVERY_PAGE_DELAY_SECONDS
+        else:
+            state.count_after = 0
+            state.next_count_at = loop.time() + self._tick
+        for scope in admitted:
+            self._enqueue(state, scope)
 
     @staticmethod
     def _fresh_capacity(state: _FamilyState) -> int:
@@ -1059,6 +1104,8 @@ class ArtifactProcessingSupervisor:
             state.retries.clear()
             state.requested_after = state.scan_after = state.scan_generation = 0
             state.scan_in_progress = False
+            state.count_after = 0
+            state.next_count_at = 0.0
             state.discovery_pending = True
 
     async def _reap_unconfirmed_exits(self) -> None:
@@ -1093,6 +1140,8 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.binding.source_count_scope_filter is not None:
+                deadlines.append(max(state.next_count_at, state.next_discovery_at))
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)

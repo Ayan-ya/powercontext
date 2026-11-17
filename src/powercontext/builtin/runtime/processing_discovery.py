@@ -45,6 +45,23 @@ async def enabled_profile_scopes(connection: AsyncConnection, scope_ids: tuple[s
     return frozenset(rows)
 
 
+async def scopes_at_source_count(
+    connection: AsyncConnection, scope_ids: tuple[str, ...], *, binding_name: str, threshold: int
+) -> frozenset[str]:
+    """Count committed journal positions after each Family's successful cursor."""
+
+    cursors = await SourceCursorRepository().load_many(connection, scope_ids, binding_name)
+    heads = SOURCE_JOURNAL_HEADS_TABLE
+    rows = await connection.execute(select(heads.c.scope_id, heads.c.position).where(heads.c.scope_id.in_(scope_ids)))
+    # The allocator advances once per inserted Source. Replays and receipt
+    # upgrades reuse the old position, so the difference counts identities.
+    return frozenset(
+        scope
+        for scope, head in rows
+        if head - (cursors[scope].cursor.sequence if scope in cursors else 0) >= threshold
+    )
+
+
 class SourceProcessingPendingProvider:
     """Inspect journal metadata, never Source bodies, prompts, or models."""
 

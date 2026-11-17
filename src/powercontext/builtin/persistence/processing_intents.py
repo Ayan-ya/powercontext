@@ -171,6 +171,22 @@ class ArtifactProcessingIntentRepository:
         )
         return cast(StoredArtifactProcessingIntent, await self.load(connection, scope_id, binding_name))
 
+    async def request_if_dirty_and_idle(self, connection: AsyncConnection, scope_id: str, binding_name: str, /) -> bool:
+        """Accept a new invocation without superseding one already accepted."""
+
+        table = ARTIFACT_PROCESSING_INTENTS_TABLE
+        result = await connection.execute(
+            update(table)
+            .where(
+                table.c.scope_id == scope_id,
+                table.c.binding_name == binding_name,
+                table.c.dirty_generation > table.c.clean_generation,
+                table.c.requested_generation == table.c.handled_generation,
+            )
+            .values(requested_generation=table.c.requested_generation + 1)
+        )
+        return result.rowcount == 1
+
     async def scan(
         self,
         connection: AsyncConnection,
