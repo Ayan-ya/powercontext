@@ -473,51 +473,74 @@ class PreparedContextBuilder:
         resolves back to the exact evidence without re-reading the whole record.
         """
 
+        terms = _query_tokens(request.query)
+        document_frequency = dict.fromkeys(terms, 0)
+        for group in memory_candidates:
+            for hit in group.hits:
+                lowered = hit.text.lower()
+                for term in terms:
+                    if term in lowered:
+                        document_frequency[term] += 1
+        weights = {term: 1.0 / max(1, document_frequency[term]) for term in terms}
+
+        scored: list[tuple[float, str, MemoryHit, int, int]] = []
+        for group in memory_candidates:
+            scope_id = group.scope_id or current_scope_id or ""
+            for hit in group.hits:
+                if not hit.text.strip():
+                    continue
+                score, start, end = _best_sentence(hit.text, terms, weights)
+                scored.append((score, scope_id, hit, start, end))
+        scored.sort(key=lambda item: -item[0])
+
         entries: list[_PreparedContextEntry] = []
         fragments: list[PreparedFragment] = []
-        for candidates in memory_candidates:
-            scope_id = candidates.scope_id or current_scope_id or ""
-            for hit in candidates.hits:
-                text = hit.text
-                if not text.strip():
+        kept: list[tuple[str, MemoryHit]] = []
+        for _score, scope_id, hit, start, end in scored:
+            fitted = _shrink_fragment(entries, request.max_bytes, scope_id, hit, start, end)
+            if fitted is None:
+                continue
+            entry, span_start, span_end = fitted
+            entries.append(entry)
+            fragments.append(
+                PreparedFragment(
+                    address=MemoryEntryAddress(
+                        memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                        entry_id=hit.entry_id,
+                        entry_version_id=hit.entry_version_id,
+                    ),
+                    start=span_start,
+                    end=span_end,
+                    text=entry.content,
+                )
+            )
+            kept.append((scope_id, hit))
+
+        # Second pass: only after every candidate has its best sentence, widen one at a time.
+        for index, (scope_id, hit) in enumerate(kept):
+            fragment = fragments[index]
+            for span_start, span_end in _span_variants(hit.text, fragment.start, fragment.end):
+                if span_start == fragment.start and span_end == fragment.end:
                     continue
-                window = min(len(text), request.max_bytes)
-                while window >= _MIN_FRAGMENT_CHARS:
-                    start, end = _match_window(text, request.query, window)
-                    entry = _PreparedContextEntry(
-                        origin=MemoryCitation(
-                            memory_ref=hit.memory_ref,
-                            entry_id=hit.entry_id,
-                            entry_version_id=hit.entry_version_id,
-                        ),
-                        kind="memory",
-                        citation={
-                            "scope_id": scope_id,
-                            "memory_ref": hit.memory_ref.model_dump(mode="json"),
-                            "entry_id": hit.entry_id,
-                            "entry_version_id": hit.entry_version_id,
-                        },
-                        content=text[start:end],
-                        truncated=False,
-                        start=start,
-                        end=end,
+                added = ""
+                if span_start < fragment.start:
+                    added += hit.text[span_start : fragment.start]
+                if span_end > fragment.end:
+                    added += hit.text[fragment.end : span_end]
+                if not any(term in added.lower() for term in terms):
+                    continue
+                candidate = _fragment_entry(scope_id, hit, span_start, span_end)
+                trial = [*entries[:index], candidate, *entries[index + 1 :]]
+                if _rendered_bytes(trial) <= request.max_bytes:
+                    entries[index] = candidate
+                    fragments[index] = PreparedFragment(
+                        address=fragment.address,
+                        start=span_start,
+                        end=span_end,
+                        text=candidate.content,
                     )
-                    if _rendered_bytes((*entries, entry)) <= request.max_bytes:
-                        entries.append(entry)
-                        fragments.append(
-                            PreparedFragment(
-                                address=MemoryEntryAddress(
-                                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
-                                    entry_id=hit.entry_id,
-                                    entry_version_id=hit.entry_version_id,
-                                ),
-                                start=start,
-                                end=end,
-                                text=text[start:end],
-                            )
-                        )
-                        break
-                    window = int(window * 0.7)
+                    break
+
         if not entries:
             return None, (), PreparedContextOmissions(), ()
         return (
@@ -780,56 +803,107 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
 
 
 _TOKEN_PATTERN = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]+")
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?。！？])\s+|\n+")
 _MIN_FRAGMENT_CHARS = 80
-_SENTENCE_ENDINGS = "\n。！？.!?"
 
 
 def _query_tokens(query: str) -> tuple[str, ...]:
-    return tuple(token.lower() for token in _TOKEN_PATTERN.findall(query))
+    return tuple(dict.fromkeys(token.lower() for token in _TOKEN_PATTERN.findall(query)))
 
 
-def _match_window(text: str, query: str, window: int) -> tuple[int, int]:
-    """Return the literal character range that best covers the query terms."""
+def _split_sentences(text: str) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    for match in _SENTENCE_SPLIT.finditer(text):
+        if match.start() > cursor:
+            spans.append((cursor, match.start()))
+        cursor = match.end()
+    if cursor < len(text):
+        spans.append((cursor, len(text)))
+    return tuple(span for span in spans if text[span[0] : span[1]].strip()) or ((0, len(text)),)
 
-    if len(text) <= window:
-        return 0, len(text)
-    tokens = _query_tokens(query)
+
+def _best_sentence(
+    text: str, terms: tuple[str, ...], weights: dict[str, float]
+) -> tuple[float, int, int]:
+    """Rank sentences by the rarity-weighted query terms they carry."""
+
     lowered = text.lower()
-    matches: list[tuple[int, int]] = []
-    for token in tokens:
-        position = lowered.find(token)
-        while position >= 0:
-            matches.append((position, position + len(token)))
-            position = lowered.find(token, position + 1)
-    if not matches:
-        return 0, window
-
-    unique = set(tokens)
-    best: tuple[tuple[int, int], int, int] | None = None
-    for start, end in matches:
-        low = max(0, min(start - window // 3, len(text) - window))
-        high = low + window
-        covered = sum(1 for token in unique if token in lowered[low:high])
-        score = (covered, -abs(high - end))
+    best: tuple[float, int, int] | None = None
+    for start, end in _split_sentences(text):
+        window = lowered[start:end]
+        score = sum(weights[term] for term in terms if term in window)
         if best is None or score > best[0]:
-            best = (score, low, high)
+            best = (score, start, end)
     assert best is not None
-    _, low, high = best
-    return _extend_to_boundary(text, low, high)
+    return best
 
 
-def _extend_to_boundary(text: str, low: int, high: int) -> tuple[int, int]:
-    if high < len(text):
-        cutoff = min(len(text), high + 120)
-        while high < cutoff and text[high] not in _SENTENCE_ENDINGS:
-            high += 1
-        if high < len(text) and text[high] in _SENTENCE_ENDINGS:
-            high += 1
-    if low > 0:
-        cutoff = max(0, low - 120)
-        while low > cutoff and text[low - 1] not in _SENTENCE_ENDINGS:
-            low -= 1
-    return low, high
+def _span_variants(text: str, start: int, end: int) -> tuple[tuple[int, int], ...]:
+    """Offer progressively smaller spans around one selected sentence."""
+
+    spans = _split_sentences(text)
+    previous = following = None
+    for index, span in enumerate(spans):
+        if span == (start, end):
+            if index > 0:
+                previous = spans[index - 1]
+            if index + 1 < len(spans):
+                following = spans[index + 1]
+            break
+    variants: list[tuple[int, int]] = []
+    if previous is not None and following is not None:
+        variants.append((previous[0], following[1]))
+    if previous is not None:
+        variants.append((previous[0], end))
+    if following is not None:
+        variants.append((start, following[1]))
+    variants.append((start, end))
+    return tuple(dict.fromkeys(variants))
+
+
+def _fragment_entry(scope_id: str, hit: MemoryHit, start: int, end: int) -> _PreparedContextEntry:
+    return _PreparedContextEntry(
+        origin=MemoryCitation(
+            memory_ref=hit.memory_ref,
+            entry_id=hit.entry_id,
+            entry_version_id=hit.entry_version_id,
+        ),
+        kind="memory",
+        citation={
+            "scope_id": scope_id,
+            "memory_ref": hit.memory_ref.model_dump(mode="json"),
+            "entry_id": hit.entry_id,
+            "entry_version_id": hit.entry_version_id,
+        },
+        content=hit.text[start:end],
+        truncated=False,
+        start=start,
+        end=end,
+    )
+
+
+def _shrink_fragment(
+    entries: Sequence[_PreparedContextEntry],
+    max_bytes: int,
+    scope_id: str,
+    hit: MemoryHit,
+    start: int,
+    end: int,
+) -> tuple[_PreparedContextEntry, int, int] | None:
+    """Keep the best sentence, shrinking only as far as the byte budget demands."""
+
+    entry = _fragment_entry(scope_id, hit, start, end)
+    if _rendered_bytes((*entries, entry)) <= max_bytes:
+        return entry, start, end
+    low, high = start, end
+    while high - low > _MIN_FRAGMENT_CHARS:
+        low += (high - low) // 8
+        high -= (high - low) // 8
+        entry = _fragment_entry(scope_id, hit, low, high)
+        if _rendered_bytes((*entries, entry)) <= max_bytes:
+            return entry, low, high
+    return None
 
 
 def _render(entries: Sequence[_PreparedContextEntry]) -> str:
