@@ -67,6 +67,18 @@ _CONCEPTS = (
     ("research and development", "research development", "r d"),
     ("dividends", "cash dividends", "dividends paid"),
     ("share repurchases", "stock repurchases", "repurchases of common stock", "buybacks"),
+    ("ebitda", "ebit", "adjusted ebitda", "unadjusted ebitda", "operating income before depreciation"),
+    ("net income", "net earnings", "net loss", "net income attributable"),
+    ("total debt", "long term debt", "short term debt", "borrowings", "debt outstanding"),
+    ("shareholders equity", "stockholders equity", "total equity", "total shareholders equity"),
+    ("interest expense", "interest income", "interest and other"),
+    ("effective tax rate", "income tax expense", "provision for income taxes", "income taxes"),
+    ("inventories", "inventory"),
+    ("accounts receivable", "receivables", "allowance for doubtful accounts"),
+    ("goodwill", "intangible assets", "intangible"),
+    ("stock based compensation", "share based compensation", "share based payments"),
+    ("pension", "retirement benefits", "postretirement"),
+    ("operating expenses", "selling general and administrative", "general and administrative"),
 )
 _QUERY_CONTEXT = re.compile(
     r"\b(?:answer in|respond to the question|give a response|state 0|express your answer)\b", re.IGNORECASE
@@ -198,11 +210,18 @@ async def search_pdf_pages(
     normalized_question = _normalized(_tokens(question))
     main_question = _normalized(query_tokens)
     years = set(_YEAR.findall(question))
+    compact_question = "".join(_tokens(question))
     named_documents = {}
     for document in dict.fromkeys(document for _, _, document, _ in candidates):
         name = _tokens(_YEAR.split(document, maxsplit=1)[0])
-        if name and (_normalized(name) in normalized_question or f" {''.join(name)} " in normalized_question):
+        compact = "".join(name)
+        if compact and compact in compact_question:
             named_documents[document] = name
+    if named_documents:
+        # A question that names its company must not retrieve another company's pages.
+        scoped = [candidate for candidate in candidates if candidate[2] in named_documents]
+        if scoped:
+            candidates = scoped
     company_terms = {term for name in named_documents.values() for term in (*name, "".join(name))}
     terms = set(query_tokens) - _STOP_WORDS - years - company_terms
     terms = {term for term in terms if len(term) > 1 and not term.isdecimal()}
@@ -226,26 +245,88 @@ async def search_pdf_pages(
         for term, count in frequencies.items()
     }
     ranked = []
-    for citation, source, document, tokens, counts in pages:
+    for index, (citation, source, document, tokens, counts) in enumerate(pages):
         norm = 1.2 * (0.45 + 0.55 * len(tokens) / average_length)
         lexical = sum(weights[term] * count * 2.2 / (count + norm) for term, count in counts.items())
         text, heading = _normalized(tokens), _normalized(tokens[:90])
-        phrases = sum(
-            weight * (2.25 + 1.5 * any(phrase in heading for phrase in aliases))
-            for aliases, weight in concepts
+        matched = [
+            number
+            for number, (aliases, _weight) in enumerate(concepts)
             if any(phrase in text for phrase in aliases)
+        ]
+        phrases = sum(
+            weight * (2.25 + 1.5 * any(phrase in heading for phrase in concepts[number][0]))
+            for number in matched
+            for aliases, weight in (concepts[number],)
         )
         score = (lexical + phrases) * (1.6 if document in named_documents else 1.0)
+        if " table of contents " in heading:
+            # A table of contents lists every statement heading but carries no evidence.
+            score *= 0.3
         if score > 0:
             score += 0.15 * len(years.intersection(tokens))
-            ranked.append((score, citation, source))
+            ranked.append((score, index, citation, source, tuple(matched)))
+
+    ranked.sort(key=lambda item: -item[0])
+
+    # Second ranking signal: plain BM25 over the query plus the matched accounting
+    # concept vocabulary. Fusing both keeps the tuned ranking's precision while
+    # recovering pages whose wording only matches after expansion.
+    expanded_terms = set(terms)
+    for aliases, _weight in concepts:
+        for alias in aliases:
+            expanded_terms.update(_tokens(alias))
+    expanded_counts = [Counter(term for term in tokens if term in expanded_terms) for *_page, tokens, _counts in pages]
+    expanded_df: Counter[str] = Counter()
+    for counts in expanded_counts:
+        expanded_df.update(counts.keys())
+    expanded_weights = {
+        term: math.log1p((len(pages) - count + 0.5) / (count + 0.5)) for term, count in expanded_df.items()
+    }
+    plain_scores = []
+    for index, page in enumerate(pages):
+        norm = 1.2 * (0.45 + 0.55 * len(page[-2]) / average_length)
+        plain = sum(
+            expanded_weights[term] * count * 2.2 / (count + norm) for term, count in expanded_counts[index].items()
+        )
+        plain_scores.append((plain, index))
+    plain_scores.sort(key=lambda item: -item[0])
+    plain_rank = {index: rank for rank, (_plain, index) in enumerate(plain_scores, start=1)}
+
+    heading_scores = []
+    numeric_scores = []
+    for index, page in enumerate(pages):
+        tokens = page[-2]
+        heading = Counter(term for term in tokens[:80] if term in expanded_terms)
+        heading_scores.append((sum(expanded_weights[term] * count for term, count in heading.items()), index))
+        density = sum(1 for term in tokens if term.isdigit()) / max(1, len(tokens))
+        numeric_scores.append((density, index))
+    heading_scores.sort(key=lambda item: -item[0])
+    numeric_scores.sort(key=lambda item: -item[0])
+    heading_rank = {index: rank for rank, (_heading, index) in enumerate(heading_scores, start=1)}
+    numeric_rank = {index: rank for rank, (_density, index) in enumerate(numeric_scores, start=1)}
+
+    tuned_rank = {index: rank for rank, (_score, index, *_rest) in enumerate(ranked, start=1)}
+    missing = len(pages) + 1000
+    fused = {
+        index: (
+            1.0 / (60 + tuned_rank.get(index, missing))
+            + 1.0 / (60 + plain_rank.get(index, missing))
+            + 0.5 / (60 + heading_rank.get(index, missing))
+            + 0.5 / (60 + numeric_rank.get(index, missing))
+        )
+        for index in range(len(pages))
+    }
+    order = sorted(fused, key=lambda index: -fused[index])
 
     results = []
-    seen: set[str] = set()
-    for _, citation, source in sorted(ranked, key=lambda item: -item[0]):
-        if source in seen:
+    seen_source: set[str] = set()
+    by_index = {index: (page[0], page[1]) for index, page in enumerate(pages)}
+    for index in order:
+        citation, source = by_index[index]
+        if source in seen_source:
             continue
-        seen.add(source)
+        seen_source.add(source)
         results.append(citation)
         if len(results) == limit:
             break
