@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -225,7 +226,7 @@ class PreparedContextBuilder:
         profile_candidates: Sequence[PreparedProfileCandidate] = (),
         code_candidates: Sequence[PreparedCodeCandidate] = (),
     ) -> PreparedContextBuild:
-        if request.include_code:
+        if request.include_code and not request.evidence_selection:
 
             def historical(history_request: PrepareContextRequest, entries: int) -> PreparedContextBuild:
                 builder = PreparedContextBuilder()
@@ -244,10 +245,11 @@ class PreparedContextBuilder:
 
         if sum(len(candidates.hits) for candidates in memory_candidates) > self.memory_candidate_limit:
             raise PreparedContextInvariantError("memory-candidate-limit")
-        if len(topic_memory_hits) > self.topic_memory_candidate_limit:
-            raise PreparedContextInvariantError("topic-memory-candidate-limit")
-        if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
-            raise PreparedContextInvariantError("experience-candidate-limit")
+        if not request.evidence_selection:
+            if len(topic_memory_hits) > self.topic_memory_candidate_limit:
+                raise PreparedContextInvariantError("topic-memory-candidate-limit")
+            if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
+                raise PreparedContextInvariantError("experience-candidate-limit")
 
         content, origins, omissions, fragments = self._select_entries(
             request=request,
@@ -262,7 +264,7 @@ class PreparedContextBuilder:
         content_bytes = len(content.encode("utf-8"))
         # The assembly path is bounded by construction (every fitted item is measured against
         # `max_bytes`), so the ceiling check belongs to the non-assembly renderer only.
-        if request.assembly is None and content_bytes > request.max_bytes:
+        if (request.evidence_selection or request.assembly is None) and content_bytes > request.max_bytes:
             raise PreparedContextInvariantError("output-budget")
         return PreparedContextBuild(
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
@@ -329,7 +331,7 @@ class PreparedContextBuilder:
         probe's counters always describe the selection the build would actually perform.
         """
 
-        if request.evidence_selection and request.assembly is None:
+        if request.evidence_selection:
             return self._select_fragments(
                 request,
                 current_scope_id=current_scope_id,
@@ -473,81 +475,89 @@ class PreparedContextBuilder:
         resolves back to the exact evidence without re-reading the whole record.
         """
 
-        terms = _query_tokens(request.query)
-        document_frequency = dict.fromkeys(terms, 0)
+        query_terms = _evidence_tokens(request.query) - _EVIDENCE_STOP_WORDS
+        if not query_terms:
+            return None, (), PreparedContextOmissions(), ()
+        han_terms = {term for term in query_terms if not term.isascii()}
+        documents: list[tuple[MemoryEntryAddress, MemoryHit]] = []
+        frequencies: Counter[str] = Counter()
+        matches: list[tuple[int, int, int, set[str]]] = []
+        seen: set[tuple[str, str, str, int, str, str]] = set()
         for group in memory_candidates:
-            for hit in group.hits:
-                lowered = hit.text.lower()
-                for term in terms:
-                    if term in lowered:
-                        document_frequency[term] += 1
-        weights = {term: 1.0 / max(1, document_frequency[term]) for term in terms}
-
-        scored: list[tuple[float, str, MemoryHit, int, int]] = []
-        for group in memory_candidates:
-            scope_id = group.scope_id or current_scope_id or ""
-            for hit in group.hits:
-                if not hit.text.strip():
-                    continue
-                score, start, end = _best_sentence(hit.text, terms, weights)
-                scored.append((score, scope_id, hit, start, end))
-        scored.sort(key=lambda item: -item[0])
-
-        entries: list[_PreparedContextEntry] = []
-        fragments: list[PreparedFragment] = []
-        kept: list[tuple[str, MemoryHit]] = []
-        for _score, scope_id, hit, start, end in scored:
-            fitted = _shrink_fragment(entries, request.max_bytes, scope_id, hit, start, end)
-            if fitted is None:
+            scope_id = group.scope_id or current_scope_id
+            if not scope_id:
                 continue
-            entry, span_start, span_end = fitted
-            entries.append(entry)
-            fragments.append(
-                PreparedFragment(
-                    address=MemoryEntryAddress(
-                        memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+            for hit in group.hits:
+                ref = hit.memory_ref
+                identity = (scope_id, ref.family, ref.artifact_id, ref.revision, hit.entry_id, hit.entry_version_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                spans = _split_sentences(hit.text)
+                sentence_terms = []
+                for start, end in spans:
+                    sentence = hit.text[start:end]
+                    terms = _evidence_tokens(sentence) & query_terms
+                    terms.update(term for term in han_terms if term in sentence)
+                    sentence_terms.append(terms)
+                document_terms = set().union(*sentence_terms)
+                if document_terms:
+                    frequencies.update(document_terms)
+                    index = len(documents)
+                    address = MemoryEntryAddress(
+                        memory=ArtifactAddress(scope_id=scope_id, artifact=ref),
                         entry_id=hit.entry_id,
                         entry_version_id=hit.entry_version_id,
-                    ),
-                    start=span_start,
-                    end=span_end,
-                    text=entry.content,
-                )
-            )
-            kept.append((scope_id, hit))
-
-        # Second pass: only after every candidate has its best sentence, widen one at a time.
-        for index, (scope_id, hit) in enumerate(kept):
-            fragment = fragments[index]
-            for span_start, span_end in _span_variants(hit.text, fragment.start, fragment.end):
-                if span_start == fragment.start and span_end == fragment.end:
-                    continue
-                added = ""
-                if span_start < fragment.start:
-                    added += hit.text[span_start : fragment.start]
-                if span_end > fragment.end:
-                    added += hit.text[fragment.end : span_end]
-                if not any(term in added.lower() for term in terms):
-                    continue
-                candidate = _fragment_entry(scope_id, hit, span_start, span_end)
-                trial = [*entries[:index], candidate, *entries[index + 1 :]]
-                if _rendered_bytes(trial) <= request.max_bytes:
-                    entries[index] = candidate
-                    fragments[index] = PreparedFragment(
-                        address=fragment.address,
-                        start=span_start,
-                        end=span_end,
-                        text=candidate.content,
                     )
+                    documents.append((address, hit))
+                    for position, ((start, end), terms) in enumerate(zip(spans, sentence_terms, strict=True)):
+                        # A neighboring sentence can explain a match without repeating its query terms.
+                        if terms or any(sentence_terms[max(0, position - 1) : position + 2]):
+                            matches.append((index, start, end, terms))
+
+        weights = {term: 1.0 / count for term, count in frequencies.items()}
+        matches.sort(key=lambda item: -sum(weights[term] for term in sorted(item[3])))
+
+        # Keep each document's accepted spans in source order. Adjacent sentences
+        # share one citation, so adding a sentence can cost only its text and offsets.
+        selected: dict[int, tuple[tuple[int, int], ...]] = {}
+        entries: dict[int, tuple[_PreparedContextEntry, ...]] = {}
+        for index, start, end, terms in matches:
+            address, hit = documents[index]
+            previous = selected.get(index, ())
+            spans = _merge_evidence_spans(hit.text, (*previous, (start, end)))
+            if not terms and len(spans) > len(previous):
+                continue
+            replacements = tuple(_fragment_entry(address, hit.text, left, right) for left, right in spans)
+            trial = {**entries, index: replacements}
+            if _rendered_bytes(tuple(chain.from_iterable(trial.values()))) <= request.max_bytes:
+                selected[index] = spans
+                entries[index] = replacements
+
+        # When no complete sentence fits, keep a literal slice around a query match.
+        if not selected:
+            for index, start, end, terms in matches:
+                if not terms:
+                    break
+                address, hit = documents[index]
+                span = _fit_evidence_window(address, hit.text, start, end, terms, weights, request.max_bytes)
+                if span is not None:
+                    selected[index] = (span,)
+                    entries[index] = (_fragment_entry(address, hit.text, *span),)
                     break
 
         if not entries:
             return None, (), PreparedContextOmissions(), ()
+        rendered_entries = tuple(chain.from_iterable(entries.values()))
         return (
-            _render(entries),
-            tuple(entry.origin for entry in entries),
+            _render(rendered_entries),
+            tuple(entry.origin for entry in rendered_entries),
             PreparedContextOmissions(),
-            tuple(fragments),
+            tuple(
+                PreparedFragment(address=documents[index][0], start=start, end=end, text=entry.content)
+                for index, spans in selected.items()
+                for (start, end), entry in zip(spans, entries[index], strict=True)
+            ),
         )
 
     def _profile_entries(self, candidates: Sequence[PreparedProfileCandidate]) -> tuple[_PreparedContextEntry, ...]:
@@ -802,13 +812,17 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     return tuple(ordered)
 
 
-_TOKEN_PATTERN = re.compile(r"[0-9A-Za-z\u4e00-\u9fff]+")
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?。！？])\s+|\n+")
-_MIN_FRAGMENT_CHARS = 80
+_TOKEN_PATTERN = re.compile(r"[A-Za-z]+|[0-9]+|[\u4e00-\u9fff]+")
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+|(?<=[。！？])\s*|\n+")
+_EVIDENCE_STOP_WORDS = frozenset(
+    "a an and are as at be been being but by can did do does for from had has have how in into is it its "
+    "may of on or that the their them there these they this those to was were what when where which who "
+    "will with would".split()
+)
 
 
-def _query_tokens(query: str) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(token.lower() for token in _TOKEN_PATTERN.findall(query)))
+def _evidence_tokens(text: str) -> set[str]:
+    return {token.lower() for token in _TOKEN_PATTERN.findall(text)}
 
 
 def _split_sentences(text: str) -> tuple[tuple[int, int], ...]:
@@ -820,89 +834,61 @@ def _split_sentences(text: str) -> tuple[tuple[int, int], ...]:
         cursor = match.end()
     if cursor < len(text):
         spans.append((cursor, len(text)))
-    return tuple(span for span in spans if text[span[0] : span[1]].strip()) or ((0, len(text)),)
+    return tuple(spans)
 
 
-def _best_sentence(
-    text: str, terms: tuple[str, ...], weights: dict[str, float]
-) -> tuple[float, int, int]:
-    """Rank sentences by the rarity-weighted query terms they carry."""
-
-    lowered = text.lower()
-    best: tuple[float, int, int] | None = None
-    for start, end in _split_sentences(text):
-        window = lowered[start:end]
-        score = sum(weights[term] for term in terms if term in window)
-        if best is None or score > best[0]:
-            best = (score, start, end)
-    assert best is not None
-    return best
+def _merge_evidence_spans(text: str, spans: Sequence[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and (start <= merged[-1][1] or text[merged[-1][1] : start].isspace()):
+            previous_start, previous_end = merged[-1]
+            merged[-1] = (previous_start, max(previous_end, end))
+        else:
+            merged.append((start, end))
+    return tuple(merged)
 
 
-def _span_variants(text: str, start: int, end: int) -> tuple[tuple[int, int], ...]:
-    """Offer progressively smaller spans around one selected sentence."""
-
-    spans = _split_sentences(text)
-    previous = following = None
-    for index, span in enumerate(spans):
-        if span == (start, end):
-            if index > 0:
-                previous = spans[index - 1]
-            if index + 1 < len(spans):
-                following = spans[index + 1]
-            break
-    variants: list[tuple[int, int]] = []
-    if previous is not None and following is not None:
-        variants.append((previous[0], following[1]))
-    if previous is not None:
-        variants.append((previous[0], end))
-    if following is not None:
-        variants.append((start, following[1]))
-    variants.append((start, end))
-    return tuple(dict.fromkeys(variants))
-
-
-def _fragment_entry(scope_id: str, hit: MemoryHit, start: int, end: int) -> _PreparedContextEntry:
+def _fragment_entry(address: MemoryEntryAddress, text: str, start: int, end: int) -> _PreparedContextEntry:
     return _PreparedContextEntry(
-        origin=MemoryCitation(
-            memory_ref=hit.memory_ref,
-            entry_id=hit.entry_id,
-            entry_version_id=hit.entry_version_id,
-        ),
+        origin=address,
         kind="memory",
         citation={
-            "scope_id": scope_id,
-            "memory_ref": hit.memory_ref.model_dump(mode="json"),
-            "entry_id": hit.entry_id,
-            "entry_version_id": hit.entry_version_id,
+            "scope_id": address.memory.scope_id,
+            "memory_ref": address.memory.artifact.model_dump(mode="json"),
+            "entry_id": address.entry_id,
+            "entry_version_id": address.entry_version_id,
         },
-        content=hit.text[start:end],
+        content=text[start:end],
         truncated=False,
         start=start,
         end=end,
     )
 
 
-def _shrink_fragment(
-    entries: Sequence[_PreparedContextEntry],
-    max_bytes: int,
-    scope_id: str,
-    hit: MemoryHit,
+def _fit_evidence_window(
+    address: MemoryEntryAddress,
+    text: str,
     start: int,
     end: int,
-) -> tuple[_PreparedContextEntry, int, int] | None:
-    """Keep the best sentence, shrinking only as far as the byte budget demands."""
-
-    entry = _fragment_entry(scope_id, hit, start, end)
-    if _rendered_bytes((*entries, entry)) <= max_bytes:
-        return entry, start, end
-    low, high = start, end
-    while high - low > _MIN_FRAGMENT_CHARS:
-        low += (high - low) // 8
-        high -= (high - low) // 8
-        entry = _fragment_entry(scope_id, hit, low, high)
-        if _rendered_bytes((*entries, entry)) <= max_bytes:
-            return entry, low, high
+    terms: set[str],
+    weights: dict[str, float],
+    max_bytes: int,
+) -> tuple[int, int] | None:
+    term = min(terms, key=lambda term: (-weights[term], term))
+    if term.isascii():
+        match = next(match for match in _TOKEN_PATTERN.finditer(text, start, end) if match[0].lower() == term)
+        anchor_start = match.start()
+    else:
+        anchor_start = text.index(term, start, end)
+    anchor_end = anchor_start + len(term)
+    radius = max(anchor_start - start, end - anchor_end)
+    while radius:
+        radius //= 2
+        left = max(start, anchor_start - radius)
+        right = min(end, anchor_end + radius)
+        entry = _fragment_entry(address, text, left, right)
+        if _rendered_bytes((entry,)) <= max_bytes:
+            return left, right
     return None
 
 

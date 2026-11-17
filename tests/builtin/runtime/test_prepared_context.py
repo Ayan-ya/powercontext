@@ -86,6 +86,62 @@ def _items(content: str | None) -> list[_PreparedItem]:
     return cast(list[_PreparedItem], json.loads(content.splitlines()[-2])["items"])
 
 
+def test_evidence_budget_keeps_disjoint_matches_ahead_of_unrelated_documents() -> None:
+    first = "The cobalt sensor was calibrated at 37 degrees."
+    last = "Cobalt remained stable during the independent study."
+    text = first + " " + "Routine administrative records " * 70 + "were archived. " + last
+    hits = (
+        _hit("evidence-" + "a" * 30, text),
+        _hit("notes-" + "b" * 30, "All schedules were circulated in advance. " * 8),
+        _hit("notes-" + "c" * 30, "Laboratory records were filed by date. " * 8),
+    )
+    scope = "scope-" + "s" * 30
+    build = PreparedContextBuilder().build_scopes_result(
+        request=PrepareContextRequest(query="the cobalt sensor", evidence_selection=True, max_bytes=1400),
+        current_scope_id=scope,
+        memory_candidates=(PreparedMemoryCandidates(scope, MEMORY_REF, hits),),
+    )
+
+    assert [(f.start, f.end, f.text) for f in build.fragments] == [
+        (0, len(first), first),
+        (len(text) - len(last), len(text), last),
+    ]
+    assert all(f.address.entry_id == hits[0].entry_id for f in build.fragments)
+    assert build.context.content is not None
+    assert build.context.content_bytes == len(build.context.content.encode("utf-8")) <= 1400
+
+
+def test_evidence_origins_keep_scope_for_identical_entries() -> None:
+    hit = _hit("same", "The cobalt sensor was calibrated at 37 degrees.")
+    build = PreparedContextBuilder().build_scopes_result(
+        request=PrepareContextRequest(query="cobalt sensor", evidence_selection=True),
+        current_scope_id="current",
+        memory_candidates=(
+            PreparedMemoryCandidates("current", MEMORY_REF, (hit,)),
+            PreparedMemoryCandidates("foreign", MEMORY_REF, (hit,)),
+        ),
+    )
+
+    addresses = tuple(fragment.address for fragment in build.fragments)
+    assert [address.memory.scope_id for address in addresses] == ["current", "foreign"]
+    assert build.origins == addresses
+
+
+def test_evidence_budget_keeps_query_match_when_long_sentence_needs_trimming() -> None:
+    text = "General administrative notes " * 90 + "海洋观测站"
+    build = PreparedContextBuilder().build_scopes_result(
+        request=PrepareContextRequest(query="海洋观测", evidence_selection=True, max_bytes=650),
+        current_scope_id="current",
+        memory_candidates=(PreparedMemoryCandidates("current", MEMORY_REF, (_hit("late", text),)),),
+    )
+
+    (fragment,) = build.fragments
+    assert fragment.text == text[fragment.start : fragment.end]
+    assert "海洋观测" in fragment.text
+    assert build.context.content is not None
+    assert build.context.content_bytes == len(build.context.content.encode("utf-8")) <= 650
+
+
 def _experience_hit(artifact_id: str = "experience-1", revision: int = 1) -> ExperienceSearchHit:
     return ExperienceSearchHit(
         artifact_ref=ArtifactRef(family="experience", artifact_id=artifact_id, revision=revision),
