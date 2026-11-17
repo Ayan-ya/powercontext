@@ -57,7 +57,11 @@ _CONCEPTS = (
     ("cost of sales", "cost of revenue", "cost of goods sold", "cogs"),
     ("gross profit", "gross margin"),
     ("legal proceedings", "legal matters", "legal battles", "litigation", "lawsuits", "contingencies"),
-    ("geographies", "geographic", "geographical", "segments", "business segments", "reportable segments"),
+    (
+        "geographies", "geography", "geographic", "geographical", "segments", "business segments",
+        "reportable segments", "principal markets", "major markets", "key markets", "geographic markets",
+        "countries in which", "international operations", "sales by country", "long lived assets by country",
+    ),
     ("restructuring", "restructuring charges", "restructuring costs", "restructuring expenses"),
     ("free cash flow", "fcf", "operating cash flow"),
     ("research and development", "research development", "r d"),

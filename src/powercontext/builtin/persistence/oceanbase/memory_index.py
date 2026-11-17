@@ -108,27 +108,33 @@ WITH lexical AS (
       {fts_filter}
     ORDER BY relevance DESC, f.memory_artifact_id, f.entry_id, f.entry_version_id
     LIMIT :candidate_limit
-), semantic AS (
+), semantic_candidates AS (
     SELECT m.memory_artifact_id, m.head_revision, m.entry_id, m.entry_version_id,
            l2_distance(m.embedding, :query_vector) AS distance
     FROM pc_memory_vector_entries AS m
+    JOIN pc_memory_entry_versions AS v ON v.scope_id = m.scope_id
+      AND v.memory_artifact_id = m.memory_artifact_id AND v.entry_version_id = m.entry_version_id
     WHERE m.scope_id = :scope_id AND m.memory_artifact_id IN :memory_artifact_ids
       {vector_filter}
     ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
     LIMIT :candidate_limit
+), semantic AS (
+    SELECT semantic_candidates.*, ROW_NUMBER() OVER () AS channel_rank
+    FROM semantic_candidates
 ), candidates AS (
     SELECT 'fts' AS channel, memory_artifact_id, head_revision, entry_id, entry_version_id,
-           relevance, NULL AS distance FROM lexical
+           relevance, NULL AS distance, NULL AS channel_rank FROM lexical
     UNION ALL
     SELECT 'vector' AS channel, memory_artifact_id, head_revision, entry_id, entry_version_id,
-           NULL AS relevance, distance FROM semantic
+           NULL AS relevance, distance, channel_rank FROM semantic
 )
 SELECT c.channel, c.memory_artifact_id, c.head_revision, c.entry_id, c.entry_version_id,
        c.distance, v.text
 FROM candidates AS c
 JOIN pc_memory_entry_versions AS v ON v.scope_id = :scope_id
  AND v.memory_artifact_id = c.memory_artifact_id AND v.entry_version_id = c.entry_version_id
-ORDER BY c.channel, c.relevance DESC, c.distance, c.memory_artifact_id, c.entry_id, c.entry_version_id
+ORDER BY c.channel, c.relevance DESC, c.distance, c.channel_rank,
+         c.memory_artifact_id, c.entry_id, c.entry_version_id
 """
 
 
