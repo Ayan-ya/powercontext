@@ -83,6 +83,21 @@ _CONCEPTS = (
 _QUERY_CONTEXT = re.compile(
     r"\b(?:answer in|respond to the question|give a response|state 0|express your answer)\b", re.IGNORECASE
 )
+# Statement headings identify the pages that carry financial evidence.
+_STATEMENT_HEADS = (
+    "consolidated statements of",
+    "consolidated statement of",
+    "statements of operations",
+    "statement of operations",
+    "statements of income",
+    "statement of income",
+    "balance sheets",
+    "balance sheet",
+    "cash flows",
+    "financial position",
+    "geographic",
+    "segment",
+)
 
 
 class PDFDocumentInput(BaseModel):
@@ -233,8 +248,10 @@ async def search_pdf_pages(
             concepts.append((aliases, weight))
 
     pages = []
+    bodies: list[str] = []
     frequencies: Counter[str] = Counter()
     for citation, source, document, body in candidates:
+        bodies.append(body)
         tokens = _tokens(body)
         counts = Counter(term for term in tokens if term in terms)
         frequencies.update(counts.keys())
@@ -293,18 +310,19 @@ async def search_pdf_pages(
     plain_scores.sort(key=lambda item: -item[0])
     plain_rank = {index: rank for rank, (_plain, index) in enumerate(plain_scores, start=1)}
 
-    heading_scores = []
     numeric_scores = []
+    statement_scores = []
     for index, page in enumerate(pages):
         tokens = page[-2]
-        heading = Counter(term for term in tokens[:80] if term in expanded_terms)
-        heading_scores.append((sum(expanded_weights[term] * count for term, count in heading.items()), index))
         density = sum(1 for term in tokens if term.isdigit()) / max(1, len(tokens))
         numeric_scores.append((density, index))
-    heading_scores.sort(key=lambda item: -item[0])
+        statement_scores.append(
+            (1.0 if any(head in bodies[index][:220].lower() for head in _STATEMENT_HEADS) else 0.0, index)
+        )
     numeric_scores.sort(key=lambda item: -item[0])
-    heading_rank = {index: rank for rank, (_heading, index) in enumerate(heading_scores, start=1)}
+    statement_scores.sort(key=lambda item: -item[0])
     numeric_rank = {index: rank for rank, (_density, index) in enumerate(numeric_scores, start=1)}
+    statement_rank = {index: rank for rank, (_statement, index) in enumerate(statement_scores, start=1)}
 
     tuned_rank = {index: rank for rank, (_score, index, *_rest) in enumerate(ranked, start=1)}
     missing = len(pages) + 1000
@@ -312,7 +330,7 @@ async def search_pdf_pages(
         index: (
             1.0 / (60 + tuned_rank.get(index, missing))
             + 1.0 / (60 + plain_rank.get(index, missing))
-            + 0.5 / (60 + heading_rank.get(index, missing))
+            + 0.5 / (60 + statement_rank.get(index, missing))
             + 0.5 / (60 + numeric_rank.get(index, missing))
         )
         for index in range(len(pages))
