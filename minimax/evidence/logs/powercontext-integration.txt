@@ -1,0 +1,7 @@
+PowerContext URL: http://127.0.0.1:18080
+New scope initially empty: yes
+Saved record count: 1
+Fresh-process resume status: ready
+Resumed state used in task context: yes
+seekdb returned sources: 5
+Required specification/code/test source groups present: yes

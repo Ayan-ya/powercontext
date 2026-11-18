@@ -1,0 +1,49 @@
+{
+  "engine": "seekdb",
+  "mode": "server",
+  "collection": "minimax_sdd_context",
+  "imported": 5,
+  "total": 5,
+  "documents": [
+    {
+      "id": "task-sdd-rel-001",
+      "kind": "task",
+      "source": "samples/release-filter/task.md",
+      "title": "SDD-REL-001 release filter change",
+      "symbols": "",
+      "sha256": "64fda9e823f5b998ecc8a4f8e478195cd8ec8ee1d60a5ceb2c84d23bbd2818bb"
+    },
+    {
+      "id": "spec-status-filter",
+      "kind": "specification",
+      "source": "samples/release-filter/specs/status-filter.md",
+      "title": "Release status filter specification",
+      "symbols": "",
+      "sha256": "be0784300f35695e4768d3e79fd5116930d12543126d094e5f76b54077a3e4a8"
+    },
+    {
+      "id": "spec-compatibility",
+      "kind": "specification",
+      "source": "samples/release-filter/specs/compatibility.md",
+      "title": "Compatibility constraints",
+      "symbols": "",
+      "sha256": "6dbb199cb3e7cdaa4081234093cd31ad3a6a373dd9fd3af5c5f79e5e1b37ea31"
+    },
+    {
+      "id": "code-release-catalog",
+      "kind": "code",
+      "source": "business/release_catalog.js",
+      "title": "Release catalog implementation",
+      "symbols": "filterReleases",
+      "sha256": "6fa8f5299aa416fbdc2ca744bff94017f996acb1e818bd9a3f4e15cbceedda6c"
+    },
+    {
+      "id": "test-release-catalog",
+      "kind": "test",
+      "source": "tests/release-catalog.behavior.test.js",
+      "title": "Release catalog target and regression tests",
+      "symbols": "target: status, regression: owner, regression: order, regression: invalid input",
+      "sha256": "0f9d3ea9e31fd929d7661b7d534c8bb57da65b7a28c2216c14105eb83de4b84e"
+    }
+  ]
+}

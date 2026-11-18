@@ -1,0 +1,13 @@
+services:
+  seekdb:
+    image: oceanbase/seekdb:latest
+    container_name: minimax-sdd-seekdb
+    restart: unless-stopped
+    ports:
+      - "2882:2881"
+      - "2887:2886"
+    volumes:
+      - minimax-seekdb-data:/var/lib/seekdb
+
+volumes:
+  minimax-seekdb-data:

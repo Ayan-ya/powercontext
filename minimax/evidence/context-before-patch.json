@@ -1,0 +1,66 @@
+{
+  "taskId": "SDD-REL-001",
+  "task": "Make release status filters accept normalized strings and arrays while preserving compatibility",
+  "database": {
+    "engine": "seekdb",
+    "mode": "server",
+    "collection": "minimax_sdd_context",
+    "queryCount": 4,
+    "queries": [
+      "Make release status filters accept normalized strings and arrays while preserving compatibility",
+      "Make release status filters accept normalized strings and arrays while preserving compatibility specification requirements constraints",
+      "Make release status filters accept normalized strings and arrays while preserving compatibility implementation source code symbols",
+      "Make release status filters accept normalized strings and arrays while preserving compatibility functional regression tests compatibility"
+    ],
+    "returnedDocumentCount": 5
+  },
+  "applicableSpecifications": [
+    {
+      "id": "spec-compatibility",
+      "source": "samples/release-filter/specs/compatibility.md",
+      "title": "Compatibility constraints",
+      "sha256": "6dbb199cb3e7cdaa4081234093cd31ad3a6a373dd9fd3af5c5f79e5e1b37ea31",
+      "excerpt": "kind: specification\nsource: samples/release-filter/specs/compatibility.md\ntitle: Compatibility constraints\n# Compatibility constraints\n\n- `COMPAT-001`: owner filtering remains exact and case-sensitive.\n- `COMPAT-002`: no filters returns the same releases in their original order.\n- `COMPAT-003`: filtering must not mutate the input array or release objects.\n- `COMPAT-004`: a non-array releases argument continues to throw `TypeError`.\n\n"
+    },
+    {
+      "id": "spec-status-filter",
+      "source": "samples/release-filter/specs/status-filter.md",
+      "title": "Release status filter specification",
+      "sha256": "be0784300f35695e4768d3e79fd5116930d12543126d094e5f76b54077a3e4a8",
+      "excerpt": "kind: specification\nsource: samples/release-filter/specs/status-filter.md\ntitle: Release status filter specification\n# Release status filter specification\n\n- `SPEC-STATUS-001`: `filters.status` accepts one string or an array of strings.\n- `SPEC-STATUS-002`: status comparison trims surrounding whitespace and ignores ASCII case.\n- `SPEC-STATUS-003`: missing, blank, or non-string status filter values do not restrict results.\n- `SPEC-STATUS-004`: an array matches a release when any normalized requested status matches.\n\nThis is the authoritative current specification. Re-importing this file after an edit must change the context returned by the CLI.\n\n"
+    }
+  ],
+  "codeLocations": [
+    {
+      "id": "code-release-catalog",
+      "source": "business/release_catalog.js",
+      "title": "Release catalog implementation",
+      "symbols": "filterReleases",
+      "sha256": "344db037b20d973981ab146cb66c19db44f53e1d0ecdbca89a2599d294fe6132",
+      "excerpt": "kind: code\nsource: business/release_catalog.js\ntitle: Release catalog implementation\nsymbols: filterReleases\nexport function filterReleases(releases, filters = {}) {\n  if (!Array.isArray(releases)) throw new TypeError(\"releases must be an array\");\n\n  const { owner, status } = filters;\n  return releases.filter((release) => {\n    if (owner !== undefined && release.owner !== owner) return false;\n    if (\n      typeof status === \"string\" &&\n      status.trim() !== \"\" &&\n      release.status !== status\n    ) {\n      return false;\n    }\n    return true;\n  });\n}\n"
+    }
+  ],
+  "verificationTests": [
+    {
+      "id": "test-release-catalog",
+      "source": "tests/release-catalog.behavior.test.js",
+      "title": "Release catalog target and regression tests",
+      "symbols": "target: status, regression: owner, regression: order, regression: invalid input",
+      "sha256": "0f9d3ea9e31fd929d7661b7d534c8bb57da65b7a28c2216c14105eb83de4b84e",
+      "excerpt": "kind: test\nsource: tests/release-catalog.behavior.test.js\ntitle: Release catalog target and regression tests\nsymbols: target: status, regression: owner, regression: order, regression: invalid input\nimport assert from \"node:assert/strict\";\nimport { pathToFileURL } from \"node:url\";\nimport { resolve } from \"node:path\";\nimport test from \"node:test\";\n\nconst modulePath = resolve(\n  process.env.RELEASE_CATALOG_MODULE ?? \"business/release_catalog.js\",\n);\nconst { filterReleases } = await import(`${pathToFileURL(modulePath).href}?run=${Date.now()}`);\n\nconst releases = [\n  { id: \"r1\", owner: \"platform\", status: \"Draft\" },\n  { id: \"r2\", owner: \"platform\", status: \"READY\" },\n  { id: \"r3\", owner: \"mobile\", status: \"ready\" },\n];\n\ntest(\"target: a status string is trimmed and case-insensitive\", () => {\n  assert.deepEqual(\n    filterReleases(releases, { status: \" ready \" }).map(({ id }) => id),\n    [\"r2\", \"r3\"],\n  );\n});\n\ntest(\"target: an array matches any normalized status\", () => {\n  assert.deepEqual(\n    filterReleases(releases, { status: [\" draft \"] }).map(({ id }) => id),\n    [\"r1\"],\n  );\n});\n\ntest(\"regression: owner matching remains exact\", () => {\n  assert.deepEqual(\n    filterReleases(releases, { owner: \"platform\" }).map(({ id }) => id),\n    [\"r1\", \"r2\"],\n  );\n  assert.deepEqual(filterReleases(releases, { owner: \"Platform\" }), []);\n});\n\ntest(\"regression: blank status does not restrict results\", () => {\n  assert.deepEqual(filterReleases(releases, { status: \"  \" }), releases);\n});\n\ntest(\"regression: filtering preserves order and does not mutate input\", () => {\n  const snapshot = structuredClone(releases);\n  assert.deepEqual(filterReleases(releases), releases);\n  assert.deepEqual(releases, snapshot);\n});\n\ntest(\"regression: invalid releases input still throws TypeError\", () => {\n  assert.throws(() => filterReleases(null), TypeError);\n});\n"
+    }
+  ],
+  "taskSources": [
+    {
+      "id": "task-sdd-rel-001",
+      "source": "samples/release-filter/task.md",
+      "title": "SDD-REL-001 release filter change",
+      "sha256": "64fda9e823f5b998ecc8a4f8e478195cd8ec8ee1d60a5ceb2c84d23bbd2818bb",
+      "excerpt": "kind: task\nsource: samples/release-filter/task.md\ntitle: SDD-REL-001 release filter change\n# Task SDD-REL-001\n\nChange `filterReleases` so status filters accept one or more values and compare them case-insensitively after trimming. Preserve exact owner matching, stable input order, non-mutation, and the existing invalid-input error.\n\nThe target tests must fail against the retained before snapshot because the behavior is absent, then pass against the modified implementation. Regression tests must pass in both runs.\n\n"
+    }
+  ],
+  "restoredState": {
+    "status": "not_requested",
+    "content": null
+  }
+}

@@ -1,0 +1,22 @@
+--- evidence/before/release_catalog.js
++++ business/release_catalog.js
+@@
+   const { owner, status } = filters;
++  const requestedStatuses = (Array.isArray(status) ? status : [status])
++    .filter((value) => typeof value === "string" && value.trim())
++    .map((value) => value.trim().toLowerCase());
++
+   return releases.filter((release) => {
+     if (owner !== undefined && release.owner !== owner) return false;
+-    if (
+-      typeof status === "string" &&
+-      status.trim() !== "" &&
+-      release.status !== status
+-    ) {
+-      return false;
+-    }
+-    return true;
++    if (requestedStatuses.length === 0) return true;
++    return requestedStatuses.includes(String(release.status).trim().toLowerCase());
+   });
+ }
