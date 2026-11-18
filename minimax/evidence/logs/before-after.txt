@@ -1,0 +1,6 @@
+Same test file: tests/release-catalog.behavior.test.js
+Before snapshot exit code: 1 (expected non-zero functional failure)
+Before target failures: case-insensitive string; multi-value array
+Before regression checks: owner, blank status, order/non-mutation, invalid input
+Modified implementation exit code: 0
+Modified result: all 6 tests passed

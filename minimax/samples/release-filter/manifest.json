@@ -1,0 +1,41 @@
+{
+  "documents": [
+    {
+      "id": "task-sdd-rel-001",
+      "kind": "task",
+      "title": "SDD-REL-001 release filter change",
+      "source": "task.md",
+      "displaySource": "samples/release-filter/task.md"
+    },
+    {
+      "id": "spec-status-filter",
+      "kind": "specification",
+      "title": "Release status filter specification",
+      "source": "specs/status-filter.md",
+      "displaySource": "samples/release-filter/specs/status-filter.md"
+    },
+    {
+      "id": "spec-compatibility",
+      "kind": "specification",
+      "title": "Compatibility constraints",
+      "source": "specs/compatibility.md",
+      "displaySource": "samples/release-filter/specs/compatibility.md"
+    },
+    {
+      "id": "code-release-catalog",
+      "kind": "code",
+      "title": "Release catalog implementation",
+      "source": "../../business/release_catalog.js",
+      "displaySource": "business/release_catalog.js",
+      "symbols": ["filterReleases"]
+    },
+    {
+      "id": "test-release-catalog",
+      "kind": "test",
+      "title": "Release catalog target and regression tests",
+      "source": "../../tests/release-catalog.behavior.test.js",
+      "displaySource": "tests/release-catalog.behavior.test.js",
+      "symbols": ["target: status", "regression: owner", "regression: order", "regression: invalid input"]
+    }
+  ]
+}
